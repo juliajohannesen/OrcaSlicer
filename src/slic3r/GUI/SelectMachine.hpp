@@ -414,6 +414,8 @@ protected:
     wxStaticText*                       m_stext_sending{ nullptr };
     wxStaticText*                       m_statictext_finish{nullptr};
     TextInput*                          m_rename_input{nullptr};
+    TextInput*                          m_user_name_input{nullptr}; // ORCA prepended to the job name (e.g. filament tracking per user)
+    CheckBox*                           m_personal_filament_check{nullptr}; // ORCA marks the job name Personal vs HackPGHOwned filament
     wxTimer*                            m_refresh_timer{ nullptr };
     std::shared_ptr<PrintJob>           m_print_job;
     wxScrolledWindow*                   m_sw_print_failed_info{nullptr};
