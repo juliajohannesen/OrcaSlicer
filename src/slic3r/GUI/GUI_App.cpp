@@ -5984,7 +5984,10 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
             std::stringstream           json_stream(body);
             boost::property_tree::read_json(json_stream, root);
 
-            std::regex matcher("[0-9]+\\.[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9]+)?(\\+[A-Za-z0-9]+)?");
+            // ORCA/HackPGH: allow '.' in the +build metadata segment (e.g. 2.4.2+hackpgh.1) so the
+            // fork version passes this full-string regex_match; otherwise get_version() returns
+            // invalid and the updater falsely reports an available update.
+            std::regex matcher("[0-9]+\\.[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9]+)?(\\+[A-Za-z0-9.]+)?");
             Semver    current_version = get_version(SoftFever_VERSION, matcher);
             Semver    best_pre(0, 0, 0);
             Semver    best_release(0, 0, 0);
