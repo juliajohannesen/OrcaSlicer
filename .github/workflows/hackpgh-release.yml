@@ -56,12 +56,17 @@ jobs:
 
       - name: Configure git identity
         run: |
-          gpg import --armor <<< $GPG_PRIVATE_KEY
+          set -euo pipefail
           git config user.name  "HackPGH"
           git config user.email "info@hackpittsburgh.org"
-          git config --global user.signingkey AF562EF1507A4C45E410E1934CB496222D702AA5
-          git config --global commit.gpgsign true
-          git config --global tag.gpgSign true
+          if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+            git config --global user.signingkey AF562EF1507A4C45E410E1934CB496222D702AA5
+            git config --global commit.gpgsign true
+            git config --global tag.gpgSign true
+          else
+            echo "::warning::GPG_PRIVATE_KEY secret not set; commits will be unsigned."
+          fi
         env:
           GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
