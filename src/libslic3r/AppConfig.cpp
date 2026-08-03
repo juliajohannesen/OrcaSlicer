@@ -40,7 +40,11 @@ using namespace nlohmann;
 
 namespace Slic3r {
 
-static const std::string VERSION_CHECK_URL = "https://check-version.orcaslicer.com/latest";
+// HackPGH: point the in-app updater at the fork's GitHub releases instead of the upstream
+// Orca version service. check_new_version_sf() sends the GitHub v3 accept header and its parser
+// handles the /releases array, so the raw API works. (Overridable via the "version_check_url"
+// ini setting.)
+static const std::string VERSION_CHECK_URL = "https://api.github.com/repos/juliajohannesen/OrcaSlicer/releases";
 static const std::string PROFILE_UPDATE_URL = "https://check-version.orcaslicer.com/profile";
 static const std::string MODELS_STR = "models";
 
