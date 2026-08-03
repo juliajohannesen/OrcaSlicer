@@ -12,9 +12,18 @@ on:
         description: 'Upstream release tag to build and publish (e.g. v2.4.2)'
         required: true
         type: string
+      iteration:
+        description: 'HackPGH iteration number N for this base (fork release is <tag>+hackpgh.N)'
+        required: true
+        type: string
+      fingerprint:
+        description: 'Fingerprint of the hackpgh/* patch set; recorded in the release body for change detection'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
-  group: hackpgh-release-${{ inputs.upstream_tag }}
+  group: hackpgh-release-${{ inputs.upstream_tag }}+hackpgh.${{ inputs.iteration }}
   cancel-in-progress: false
 
 permissions:
@@ -25,12 +34,15 @@ permissions:
 env:
   UPSTREAM: OrcaSlicer/OrcaSlicer
   TAG: ${{ inputs.upstream_tag }}
-  REL_BRANCH: hackpgh/rel/${{ inputs.upstream_tag }}
+  ITERATION: ${{ inputs.iteration }}
+  FINGERPRINT: ${{ inputs.fingerprint }}
+  FORK_TAG: ${{ inputs.upstream_tag }}+hackpgh.${{ inputs.iteration }}
+  REL_BRANCH: hackpgh/rel/${{ inputs.upstream_tag }}+hackpgh.${{ inputs.iteration }}
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   build-and-publish:
-    name: Build ${{ inputs.upstream_tag }} + publish
+    name: Build ${{ inputs.upstream_tag }}+hackpgh.${{ inputs.iteration }} + publish
     runs-on: ubuntu-latest
     timeout-minutes: 350   # release builds can take ~1-2h; stay under the 6h job cap
     steps:
@@ -99,23 +111,38 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Stamp the fork version into version.inc
+        run: |
+          set -euo pipefail
+          fork_ver="${TAG#v}+hackpgh.${ITERATION}"
+          # This is the value the whole pipeline reads for artifact names and the in-app version.
+          sed -i -E 's|set\(SoftFever_VERSION "[^"]*"\)|set(SoftFever_VERSION "'"$fork_ver"'")|' version.inc
+          grep 'set(SoftFever_VERSION' version.inc
+          git add version.inc
+          git commit -m "HackPGH: set version ${fork_ver}"
           git push --force-with-lease origin "$REL_BRANCH"
 
       - name: Create draft release (if absent)
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            is_draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          if gh release view "$FORK_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
             if [ "$is_draft" != "true" ]; then
-              echo "::error::Release $TAG already exists and is published. Aborting."
+              echo "::error::Release $FORK_TAG already exists and is published. Aborting."
               exit 1
             fi
-            echo "Reusing existing draft release $TAG."
+            echo "Reusing existing draft release $FORK_TAG."
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+            # Human-readable list of the patch branches + tips that went into this build.
+            branch_lines=$(git branch -r --list 'origin/hackpgh/*' \
+              | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' \
+              | while read -r b; do echo "- \`${b#origin/}\` @ $(git rev-parse --short "$b")"; done)
+            notes=$(printf 'HackPGH build of upstream **%s** with the fork'"'"'s hackpgh/* patches (iteration %s).\n\nPatch branches:\n%s\n\n<!-- hackpgh-fingerprint: %s -->' \
+              "$TAG" "$ITERATION" "$branch_lines" "$FINGERPRINT")
+            gh release create "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --draft \
               --target "$REL_BRANCH" \
-              --title "$TAG (HackPGH)" \
-              --notes "HackPGH build of upstream **$TAG** with the fork's hackpgh/* patches. Built by hackpgh-release.yml." \
+              --title "$FORK_TAG (HackPGH)" \
+              --notes "$notes" \
               --verify-tag=false
           fi
 
@@ -209,14 +236,14 @@ jobs:
       - name: Upload assets to the draft release
         run: |
           set -euo pipefail
-          gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+          gh release upload "$FORK_TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
 
       - name: Publish the release (flip out of draft)
         run: |
           set -euo pipefail
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-          echo "Published release $TAG."
+          gh release edit "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Published release $FORK_TAG."
 
       - name: Delete the transient build branch
         # Only on success; a failed run keeps the branch so the exact built ref can be inspected.
