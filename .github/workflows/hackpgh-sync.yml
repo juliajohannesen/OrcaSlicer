@@ -12,6 +12,10 @@ on:
   schedule:
     - cron: '0 8 * * *'   # daily at 08:00 UTC
   workflow_dispatch:
+  push:
+    branches:
+      - 'hackpgh/**'        # a push to a patch branch re-syncs main and may cut a new iteration
+      - '!hackpgh/rel/**'   # ...except the transient release build branches
 
 concurrency:
   group: hackpgh-sync
@@ -99,24 +103,59 @@ jobs:
           git push --force-with-lease origin synced:main
           echo "main updated: upstream/main + merged hackpgh/* branches."
 
-      - name: Mirror the latest new upstream stable release
+      - name: Evaluate whether to cut a new HackPGH iteration
         run: |
           set -euo pipefail
 
-          # Latest stable (non-draft, non-prerelease) upstream release tag.
-          latest=$(gh api "repos/${UPSTREAM}/releases" --paginate \
+          # Base = latest stable (non-draft, non-prerelease) upstream release tag.
+          base=$(gh api "repos/${UPSTREAM}/releases" --paginate \
             --jq 'map(select(.draft==false and .prerelease==false)) | sort_by(.published_at) | reverse | .[0].tag_name // empty')
-          if [ -z "$latest" ]; then
+          if [ -z "$base" ]; then
             echo "No upstream stable release found; nothing to mirror."
             exit 0
           fi
-          echo "Latest upstream stable release: $latest"
+          echo "Latest upstream stable base: $base"
 
-          # Does the fork already have it (published OR an in-progress draft)?
-          if gh release view "$latest" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Fork already has release $latest (published or draft in progress); nothing to do."
+          # Fingerprint = sha256 of the sorted "<branch> <sha>" lines for the exact patch set the
+          # release will cherry-pick (every origin/hackpgh/* except the transient rel branches).
+          fp=$(git branch -r --list 'origin/hackpgh/*' \
+                 | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' \
+                 | while read -r b; do echo "$b $(git rev-parse "$b")"; done \
+                 | sort | sha256sum | cut -d' ' -f1)
+          echo "Current hackpgh fingerprint: $fp"
+
+          # Find the highest existing iteration for this base (drafts included) and its stored fingerprint.
+          latest_tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName --jq \
+            "[.[] | select(.tagName | test(\"^${base}\\\\+hackpgh\\\\.[0-9]+$\")) | .tagName] | sort_by(sub(\".*hackpgh\\\\.\";\"\") | tonumber) | last // empty")
+
+          if [ -z "$latest_tag" ]; then
+            # No iteration for this base yet -> always publish .0 (new base / first setup).
+            echo "No $base+hackpgh.* release yet; dispatching iteration 0."
+            gh workflow run hackpgh-release.yml --repo "$GITHUB_REPOSITORY" \
+              -f upstream_tag="$base" -f iteration=0 -f fingerprint="$fp"
             exit 0
           fi
 
-          echo "Release $latest is missing from the fork; dispatching hackpgh-release.yml."
-          gh workflow run hackpgh-release.yml --repo "$GITHUB_REPOSITORY" -f upstream_tag="$latest"
+          k=${latest_tag##*hackpgh.}
+          echo "Highest existing iteration for $base: $k ($latest_tag)"
+
+          # If that iteration is still a draft, a build is in progress -> don't stack another.
+          is_draft=$(gh release view "$latest_tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          if [ "$is_draft" = "true" ]; then
+            echo "$latest_tag is still a draft (build in progress); skipping."
+            exit 0
+          fi
+
+          # Compare fingerprints; skip if the patch set is unchanged.
+          stored_fp=$(gh release view "$latest_tag" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' \
+            | grep -oE 'hackpgh-fingerprint: [0-9a-f]+' | awk '{print $2}' | head -1 || true)
+          if [ "$stored_fp" = "$fp" ]; then
+            echo "hackpgh/* unchanged since $latest_tag (fingerprint match); nothing to publish."
+            exit 0
+          fi
+
+          next=$((k + 1))
+          echo "hackpgh/* changed since $latest_tag; dispatching iteration $next."
+          gh workflow run hackpgh-release.yml --repo "$GITHUB_REPOSITORY" \
+            -f upstream_tag="$base" -f iteration="$next" -f fingerprint="$fp"
