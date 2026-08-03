@@ -3,6 +3,12 @@
 # upstream has published a new *stable* release the fork doesn't have yet, kicks off
 # hackpgh-release.yml to build and publish it.
 #
+# hackpgh/generate/* branches are special: they carry a transformation script instead of
+# a diff. After ALL hackpgh/* branches are merged, every scripts/hackpgh/*/generate.sh
+# found in the assembled tree is run (sorted) and its output committed. A generate script
+# must be deterministic and exit nonzero on upstream drift — a failure aborts the sync
+# (main untouched) and opens/refreshes a tracking issue.
+#
 # IMPORTANT: this file (and every fork-only change) must live on a hackpgh/* branch that
 # this workflow merges in. Anything committed straight to `main` is wiped by the daily
 # reset to upstream/main.
@@ -97,11 +103,49 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Apply generate scripts (hackpgh/generate/*)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          gens=(scripts/hackpgh/*/generate.sh)
+          if [ ${#gens[@]} -eq 0 ]; then
+            echo "No generate scripts in the merged tree; skipping."
+            exit 0
+          fi
+          mapfile -t gens < <(printf '%s\n' "${gens[@]}" | LC_ALL=C sort)
+          for g in "${gens[@]}"; do
+            name=$(basename "$(dirname "$g")")
+            echo "::group::Running $g"
+            if ! bash "$g"; then
+              echo "::endgroup::"
+              echo "::error::Generate script $g failed. main left untouched."
+              title="Generate failure: $name"
+              body=$(printf 'The HackPGH sync could not apply `%s` to the merged tree: the script exited nonzero (usually a drift assertion — upstream moved an anchor the script expects).\n\n`main` was **not** updated this run. Fix the script on its `hackpgh/generate/%s` branch and re-run **HackPGH Sync**.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "$g" "$name" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label "sync-conflict" 2>/dev/null \
+                  || gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "HackPGH: apply generate scripts"
+            echo "Generate output committed: $(git rev-parse --short HEAD)"
+          else
+            echo "Generate scripts produced no changes."
+          fi
+
       - name: Push rebuilt main
         run: |
           set -euo pipefail
           git push --force-with-lease origin synced:main
-          echo "main updated: upstream/main + merged hackpgh/* branches."
+          echo "main updated: upstream/main + merged hackpgh/* branches + generate output."
 
       - name: Evaluate whether to cut a new HackPGH iteration
         run: |
