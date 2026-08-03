@@ -39,8 +39,15 @@ jobs:
 
       - name: Configure git identity
         run: |
-          git config user.name  "hackpgh-bot"
-          git config user.email "hackpgh-bot@users.noreply.github.com"
+          gpg import --armor <<< $GPG_PRIVATE_KEY
+          git config user.name  "HackPGH"
+          git config user.email "info@hackpittsburgh.org"
+          git config --global user.signingkey AF562EF1507A4C45E410E1934CB496222D702AA5
+          git config --global commit.gpgsign true
+          git config --global tag.gpgSign true
+        env:
+          GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
       - name: Fetch upstream and all fork branches
         run: |
