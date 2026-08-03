@@ -1,8 +1,10 @@
 # HackPGH fork-only workflow. Builds and publishes one upstream release tag as a fork
-# release: check out upstream's tagged commit, merge our hackpgh/* patches onto it, build
-# every platform through the existing build_all.yml pipeline, then upload the artifacts to
-# a GitHub Release that starts as a draft and is flipped to published only after the build
-# succeeds. Normally invoked by hackpgh-sync.yml; can also be run manually for any tag.
+# release: check out upstream's tagged commit, merge our hackpgh/* patches onto it, run
+# any scripts/hackpgh/*/generate.sh (hackpgh/generate/* transformation branches) against
+# the assembled tree, build every platform through the existing build_all.yml pipeline,
+# then upload the artifacts to a GitHub Release that starts as a draft and is flipped to
+# published only after the build succeeds. Normally invoked by hackpgh-sync.yml; can also
+# be run manually for any tag.
 name: HackPGH Release
 
 on:
@@ -110,6 +112,43 @@ jobs:
             fi
             echo "::endgroup::"
           done
+
+      - name: Apply generate scripts (hackpgh/generate/*)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          gens=(scripts/hackpgh/*/generate.sh)
+          if [ ${#gens[@]} -eq 0 ]; then
+            echo "No generate scripts in the release tree; skipping."
+            exit 0
+          fi
+          mapfile -t gens < <(printf '%s\n' "${gens[@]}" | LC_ALL=C sort)
+          for g in "${gens[@]}"; do
+            name=$(basename "$(dirname "$g")")
+            echo "::group::Running $g"
+            if ! bash "$g"; then
+              echo "::endgroup::"
+              title="Release generate failure: $name vs ${TAG}"
+              body=$(printf 'Building release `%s` failed: generate script `%s` exited nonzero against the `%s` source (usually a drift assertion — the tagged tree differs from what the script expects).\n\nFix the script on its `hackpgh/generate/%s` branch (or provide a %s-compatible variant) and re-run **HackPGH Release** with `upstream_tag=%s`.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "$TAG" "$g" "$TAG" "$name" "$TAG" "$TAG" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              echo "::error::$title"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "HackPGH: apply generate scripts"
+            echo "Generate output committed: $(git rev-parse --short HEAD)"
+          else
+            echo "Generate scripts produced no changes."
+          fi
 
       - name: Stamp the fork version into version.inc
         run: |
