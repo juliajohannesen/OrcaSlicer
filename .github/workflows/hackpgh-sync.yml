@@ -52,11 +52,21 @@ jobs:
           set -euo pipefail
           git config user.name  "HackPGH"
           git config user.email "info@hackpittsburgh.org"
+          # Enable signing only if the imported key can actually sign headlessly;
+          # a broken signing setup must degrade to unsigned commits, not break
+          # every git merge/commit in the run.
           if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
             printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
-            git config --global user.signingkey AF562EF1507A4C45E410E1934CB496222D702AA5
-            git config --global commit.gpgsign true
-            git config --global tag.gpgSign true
+            if echo test | gpg --batch --yes --pinentry-mode loopback \
+                 --local-user AF562EF1507A4C45E410E1934CB496222D702AA5 \
+                 --clearsign >/dev/null 2>&1; then
+              git config --global user.signingkey AF562EF1507A4C45E410E1934CB496222D702AA5
+              git config --global commit.gpgsign true
+              git config --global tag.gpgSign true
+              echo "GPG signing enabled."
+            else
+              echo "::warning::GPG key imported but a test signature failed (passphrase/pinentry?); commits will be unsigned."
+            fi
           else
             echo "::warning::GPG_PRIVATE_KEY secret not set; commits will be unsigned."
           fi
