@@ -58,9 +58,10 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || \
             git remote set-url upstream "https://github.com/${UPSTREAM}.git"
           git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+          git fetch --no-tags upstream main   # needed to isolate each hackpgh branch's own commits
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
 
-      - name: Build release branch = tag + merged hackpgh/*
+      - name: Build release branch = tag + hackpgh/* patches
         run: |
           set -euo pipefail
           git checkout -B "$REL_BRANCH" "refs/tags/${TAG}"
@@ -68,14 +69,24 @@ jobs:
           mapfile -t branches < <(git branch -r --list 'origin/hackpgh/*' \
             | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' || true)
 
+          # Apply only each branch's OWN commits (those not already in upstream/main) onto the
+          # release tag. Do NOT `git merge` the branches: a hackpgh/* branch is based on recent
+          # upstream, so merging it onto an older tag drags the whole tag->HEAD upstream delta in
+          # as conflicts. Cherry-picking upstream/main..<branch> transplants just the fork's patches.
           for b in "${branches[@]}"; do
-            echo "::group::Merging $b onto $TAG"
-            if ! git merge --no-edit --no-ff "$b"; then
-              git merge --abort || true
+            mapfile -t commits < <(git rev-list --reverse --no-merges "upstream/main..$b")
+            if [ ${#commits[@]} -eq 0 ]; then
+              echo "$b has no commits beyond upstream/main; skipping."
+              continue
+            fi
+            echo "::group::Cherry-picking ${#commits[@]} commit(s) from $b onto $TAG"
+            if ! git cherry-pick -x "${commits[@]}"; then
+              conflicted=$(git diff --name-only --diff-filter=U | sed 's/^/  - /')
+              git cherry-pick --abort || true
               echo "::endgroup::"
               title="Release conflict: ${b#origin/} vs ${TAG}"
-              body=$(printf 'Building release `%s` failed: `%s` conflicts with the upstream tag. Rebase/resolve that branch against `%s` and re-run **HackPGH Release** with `upstream_tag=%s`.\n\n_Run: %s/%s/actions/runs/%s_' \
-                "$TAG" "${b#origin/}" "$TAG" "$TAG" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              body=$(printf 'Building release `%s` failed: the patches on `%s` do not apply cleanly to the `%s` source (they were authored against newer upstream). Conflicting file(s):\n\n%s\n\nRebase/resolve `%s` against `%s` (or provide a %s-compatible variant) and re-run **HackPGH Release** with `upstream_tag=%s`.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "$TAG" "${b#origin/}" "$TAG" "$conflicted" "${b#origin/}" "$TAG" "$TAG" "$TAG" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
               existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
               if [ -n "$existing" ]; then
                 gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
