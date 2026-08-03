@@ -1,0 +1,206 @@
+# HackPGH fork-only workflow. Builds and publishes one upstream release tag as a fork
+# release: check out upstream's tagged commit, merge our hackpgh/* patches onto it, build
+# every platform through the existing build_all.yml pipeline, then upload the artifacts to
+# a GitHub Release that starts as a draft and is flipped to published only after the build
+# succeeds. Normally invoked by hackpgh-sync.yml; can also be run manually for any tag.
+name: HackPGH Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream release tag to build and publish (e.g. v2.4.2)'
+        required: true
+        type: string
+
+concurrency:
+  group: hackpgh-release-${{ inputs.upstream_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # push build branch, create/edit release, upload assets
+  actions: write    # dispatch build_all.yml and read its artifacts
+  issues: write     # open a tracking issue on merge conflict
+
+env:
+  UPSTREAM: OrcaSlicer/OrcaSlicer
+  TAG: ${{ inputs.upstream_tag }}
+  REL_BRANCH: hackpgh/rel/${{ inputs.upstream_tag }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build-and-publish:
+    name: Build ${{ inputs.upstream_tag }} + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # release builds can take ~1-2h; stay under the 6h job cap
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "hackpgh-bot"
+          git config user.email "hackpgh-bot@users.noreply.github.com"
+
+      - name: Fetch upstream tag and fork branches
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Build release branch = tag + merged hackpgh/*
+        run: |
+          set -euo pipefail
+          git checkout -B "$REL_BRANCH" "refs/tags/${TAG}"
+
+          mapfile -t branches < <(git branch -r --list 'origin/hackpgh/*' \
+            | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' || true)
+
+          for b in "${branches[@]}"; do
+            echo "::group::Merging $b onto $TAG"
+            if ! git merge --no-edit --no-ff "$b"; then
+              git merge --abort || true
+              echo "::endgroup::"
+              title="Release conflict: ${b#origin/} vs ${TAG}"
+              body=$(printf 'Building release `%s` failed: `%s` conflicts with the upstream tag. Rebase/resolve that branch against `%s` and re-run **HackPGH Release** with `upstream_tag=%s`.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "$TAG" "${b#origin/}" "$TAG" "$TAG" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              echo "::error::$title"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+          git push --force-with-lease origin "$REL_BRANCH"
+
+      - name: Create draft release (if absent)
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $TAG already exists and is published. Aborting."
+              exit 1
+            fi
+            echo "Reusing existing draft release $TAG."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --target "$REL_BRANCH" \
+              --title "$TAG (HackPGH)" \
+              --notes "HackPGH build of upstream **$TAG** with the fork's hackpgh/* patches. Built by hackpgh-release.yml." \
+              --verify-tag=false
+          fi
+
+      - name: Dispatch build_all.yml on the release branch
+        id: dispatch
+        run: |
+          set -euo pipefail
+          # Timestamp just before dispatch so we can identify the run we created.
+          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run build_all.yml --repo "$GITHUB_REPOSITORY" --ref "$REL_BRANCH"
+          echo "since=$before" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the dispatched build run id
+        id: run
+        run: |
+          set -euo pipefail
+          since="${{ steps.dispatch.outputs.since }}"
+          run_id=""
+          for i in $(seq 1 24); do   # up to ~6 min for the run to register
+            run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+              --workflow build_all.yml --branch "$REL_BRANCH" --event workflow_dispatch \
+              --json databaseId,createdAt --limit 20 \
+              --jq "map(select(.createdAt >= \"$since\")) | sort_by(.createdAt) | reverse | .[0].databaseId // empty")
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            echo "Build run not visible yet (attempt $i); waiting..."
+            sleep 15
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::Could not find the dispatched build_all run for $REL_BRANCH."
+            exit 1
+          fi
+          echo "Build run id: $run_id"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the build to finish
+        run: |
+          set -euo pipefail
+          # Blocks until the run completes; exits non-zero if it did not succeed,
+          # which leaves the release as a draft for inspection.
+          gh run watch "${{ steps.run.outputs.run_id }}" --repo "$GITHUB_REPOSITORY" \
+            --interval 60 --exit-status
+
+      # ---- asset assembly reused from .github/workflows/publish_release.yml:74-131 ----
+      - name: Download release artifacts from build run
+        env:
+          RUN_ID: ${{ steps.run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          # Windows_V* (not Windows_*) keeps the MSIX Store artifact out: it goes to Partner Center, not GitHub releases.
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts \
+            -p 'OrcaSlicer_Windows_V*' \
+            -p 'OrcaSlicer_Mac_universal_*' \
+            -p 'OrcaSlicer_Linux_ubuntu_*' \
+            -p 'OrcaSlicer-Linux-flatpak_*' \
+            -p 'PDB'
+          echo "Downloaded artifact folders:"
+          ls -1 artifacts
+
+      - name: Assemble release assets
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+
+          # gh run download auto-extracts each artifact into a folder, so the inner
+          # binaries are already unzipped. Copy the inner binary for each platform.
+          find artifacts -type f -name '*.exe' -path '*OrcaSlicer_Windows_V*' ! -path '*_portable*' -exec cp -v {} upload/ \;
+          find artifacts -type f -name '*.dmg' -path '*OrcaSlicer_Mac_universal_*' -exec cp -v {} upload/ \;
+          find artifacts -type f -name '*.AppImage' -exec cp -v {} upload/ \;
+          find artifacts -type f -name '*.flatpak' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'Debug_PDB_*.7z' -exec cp -v {} upload/ \;
+
+          # Portable Windows builds (x64 + arm64) are unzipped folder artifacts; re-zip each.
+          mapfile -t portable_dirs < <(find artifacts -maxdepth 1 -type d -name 'OrcaSlicer_Windows_*_portable')
+          if [ ${#portable_dirs[@]} -eq 0 ]; then
+            echo "::warning::Windows portable artifact not found."
+          fi
+          for portable_dir in "${portable_dirs[@]}"; do
+            ( cd "$portable_dir" && zip -qr "$GITHUB_WORKSPACE/upload/$(basename "$portable_dir").zip" . )
+            echo "Zipped portable -> $(basename "$portable_dir").zip"
+          done
+
+          echo "Assets to upload:"
+          ls -lh upload
+          if [ -z "$(ls -A upload)" ]; then
+            echo "::error::No assets assembled. Check the build run's artifacts."
+            exit 1
+          fi
+
+      - name: Upload assets to the draft release
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+
+      - name: Publish the release (flip out of draft)
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Published release $TAG."
+
+      - name: Delete the transient build branch
+        # Only on success; a failed run keeps the branch so the exact built ref can be inspected.
+        run: |
+          git push origin --delete "$REL_BRANCH" 2>/dev/null || true

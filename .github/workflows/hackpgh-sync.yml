@@ -1,0 +1,115 @@
+# HackPGH fork-only workflow. Keeps this fork tracking upstream OrcaSlicer/OrcaSlicer:
+# once a day it rebuilds `main` as "latest upstream + our hackpgh/* patches", then, if
+# upstream has published a new *stable* release the fork doesn't have yet, kicks off
+# hackpgh-release.yml to build and publish it.
+#
+# IMPORTANT: this file (and every fork-only change) must live on a hackpgh/* branch that
+# this workflow merges in. Anything committed straight to `main` is wiped by the daily
+# reset to upstream/main.
+name: HackPGH Sync
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # daily at 08:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: hackpgh-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # force-push main
+  issues: write     # open a tracking issue on merge conflict
+  actions: write    # dispatch hackpgh-release.yml
+
+env:
+  UPSTREAM: OrcaSlicer/OrcaSlicer
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync:
+    name: Sync main from upstream + merge hackpgh/*
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "hackpgh-bot"
+          git config user.email "hackpgh-bot@users.noreply.github.com"
+
+      - name: Fetch upstream and all fork branches
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream main
+          # make sure every origin/hackpgh/* branch is available locally
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Rebuild main = upstream/main + merged hackpgh/*
+        run: |
+          set -euo pipefail
+          git checkout -B synced upstream/main
+
+          # Merge every hackpgh/* branch except the transient release build branches (hackpgh/rel/*).
+          mapfile -t branches < <(git branch -r --list 'origin/hackpgh/*' \
+            | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' || true)
+
+          if [ ${#branches[@]} -eq 0 ]; then
+            echo "::warning::No hackpgh/* branches found to merge; main will match upstream exactly."
+          fi
+
+          for b in "${branches[@]}"; do
+            echo "::group::Merging $b"
+            if ! git merge --no-edit --no-ff "$b"; then
+              git merge --abort || true
+              echo "::endgroup::"
+              echo "::error::Merge conflict between upstream/main and $b. main left untouched."
+              title="Sync conflict: ${b#origin/} vs upstream/main"
+              body=$(printf 'The daily HackPGH sync could not merge `%s` onto the latest `upstream/main` because of a conflict.\n\n`main` was **not** updated this run. Please rebase/resolve `%s` against upstream and re-run **HackPGH Sync**.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "${b#origin/}" "${b#origin/}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              # De-dupe: reuse an existing open issue with the same title if present.
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label "sync-conflict" 2>/dev/null \
+                  || gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Push rebuilt main
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin synced:main
+          echo "main updated: upstream/main + merged hackpgh/* branches."
+
+      - name: Mirror the latest new upstream stable release
+        run: |
+          set -euo pipefail
+
+          # Latest stable (non-draft, non-prerelease) upstream release tag.
+          latest=$(gh api "repos/${UPSTREAM}/releases" --paginate \
+            --jq 'map(select(.draft==false and .prerelease==false)) | sort_by(.published_at) | reverse | .[0].tag_name // empty')
+          if [ -z "$latest" ]; then
+            echo "No upstream stable release found; nothing to mirror."
+            exit 0
+          fi
+          echo "Latest upstream stable release: $latest"
+
+          # Does the fork already have it (published OR an in-progress draft)?
+          if gh release view "$latest" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Fork already has release $latest (published or draft in progress); nothing to do."
+            exit 0
+          fi
+
+          echo "Release $latest is missing from the fork; dispatching hackpgh-release.yml."
+          gh workflow run hackpgh-release.yml --repo "$GITHUB_REPOSITORY" -f upstream_tag="$latest"
