@@ -53,6 +53,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+          # Push with HACKPGH_PUSH_TOKEN, not GITHUB_TOKEN (see the fetch step's guard).
+          token: ${{ secrets.HACKPGH_PUSH_TOKEN || github.token }}
 
       - name: Configure git identity
         run: |
@@ -82,6 +84,8 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
       - name: Fetch upstream tag and fork branches
+        env:
+          HACKPGH_PUSH_TOKEN: ${{ secrets.HACKPGH_PUSH_TOKEN }}
         run: |
           set -euo pipefail
           git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || \
@@ -89,6 +93,19 @@ jobs:
           git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
           git fetch --no-tags upstream main   # needed to isolate each hackpgh branch's own commits
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+          # The release branch carries the upstream tag's history, whose .github/workflows
+          # files are not reachable from any fork ref. GitHub rejects pushing those with the
+          # Actions GITHUB_TOKEN (a GitHub App token that cannot hold the `workflows`
+          # permission), so the checkout step persists HACKPGH_PUSH_TOKEN instead — a
+          # fine-grained PAT on this repo with Contents:RW + Workflows:RW. Only this
+          # workflow needs it: routing the sync workflow's main push through a PAT would
+          # stop suppressing `on: push` triggers and start a full upstream build_all on
+          # every daily sync. Fail fast here, before an hour of assembly work.
+          if [ -z "${HACKPGH_PUSH_TOKEN:-}" ]; then
+            echo "::error::HACKPGH_PUSH_TOKEN secret not set; pushing the release branch would be rejected because GITHUB_TOKEN cannot push workflow files. Create a fine-grained PAT (Contents:RW + Workflows:RW on ${GITHUB_REPOSITORY}) and save it as the HACKPGH_PUSH_TOKEN repo secret."
+            exit 1
+          fi
 
       - name: Build release branch = tag + hackpgh/* patches
         run: |
