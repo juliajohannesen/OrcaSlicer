@@ -42,6 +42,16 @@ Current: `hackpgh/generate/branding` — full HackPGH recolor (gold accents
 dark-mode-only, regenerated SVG/PNG/ICO/ICNS assets). See
 `scripts/hackpgh/branding/brandkit/palette.py` for the palette and derivation.
 
+### Required secrets
+
+- **`HACKPGH_PUSH_TOKEN`** — fine-grained PAT on this repo, permissions
+  **Contents: Read/Write + Workflows: Read/Write**. The release branch carries
+  the upstream tag's history (including `.github/workflows` files unreachable
+  from fork refs), which the Actions `GITHUB_TOKEN` is forbidden to push.
+  The release workflow fails fast without it. Renew before expiry.
+- **`GPG_PUBLIC_KEY` / `GPG_PRIVATE_KEY`** *(optional)* — sign the automation's
+  commits; runs degrade to unsigned with a warning when absent or unusable.
+
 ### When something breaks
 
 - **`Sync conflict:` issue** — a patch branch no longer merges onto upstream;
