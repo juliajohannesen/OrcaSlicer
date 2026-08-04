@@ -102,6 +102,27 @@ jobs:
           # release tag. Do NOT `git merge` the branches: a hackpgh/* branch is based on recent
           # upstream, so merging it onto an older tag drags the whole tag->HEAD upstream delta in
           # as conflicts. Cherry-picking upstream/main..<branch> transplants just the fork's patches.
+
+          # cherry-pick that drops empty commits instead of stopping on them. Covers both
+          # commits that were empty to begin with (sync-trigger markers) and ones that become
+          # empty because the patch is already in the tag. `--empty=drop` alone is not enough:
+          # it only drops the became-empty kind. An empty stop is distinguishable from a
+          # conflict stop by its clean index (no unmerged paths, nothing staged).
+          cherry_pick_dropping_empties() {
+            if git cherry-pick -x "$@"; then
+              return 0
+            fi
+            while git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+                  && [ -z "$(git diff --name-only --diff-filter=U)" ] \
+                  && git diff --cached --quiet; do
+              echo "Dropping empty commit: $(git log -1 --format='%h %s' CHERRY_PICK_HEAD)"
+              if git cherry-pick --skip; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
           for b in "${branches[@]}"; do
             mapfile -t commits < <(git rev-list --reverse --no-merges "upstream/main..$b")
             if [ ${#commits[@]} -eq 0 ]; then
@@ -109,7 +130,7 @@ jobs:
               continue
             fi
             echo "::group::Cherry-picking ${#commits[@]} commit(s) from $b onto $TAG"
-            if ! git cherry-pick -x "${commits[@]}"; then
+            if ! cherry_pick_dropping_empties "${commits[@]}"; then
               conflicted=$(git diff --name-only --diff-filter=U | sed 's/^/  - /')
               git cherry-pick --abort || true
               echo "::endgroup::"
