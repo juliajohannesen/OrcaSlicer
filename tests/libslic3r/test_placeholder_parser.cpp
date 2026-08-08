@@ -267,6 +267,16 @@ SCENARIO("Placeholder parser coFloatsOrPercents vector access", "[PlaceholderPar
     PlaceholderParser parser;
     auto config = DynamicPrintConfig::full_print_config();
 
+    // On the release/v2.4 branch small_perimeter_speed and outer_wall_speed are still
+    // scalar (coFloatOrPercent/coFloat): the vector-access feature and this test were
+    // cherry-picked there without the per-extruder option-type migration, so the
+    // option<>() below returns nullptr and the scenario used to segfault. Skip it
+    // there instead; on trees with the vector types this guard is a no-op.
+    if (config.option<ConfigOptionFloatsOrPercentsNullable>("small_perimeter_speed") == nullptr) {
+        SUCCEED("small_perimeter_speed is not a FloatsOrPercents vector in this tree; scenario does not apply");
+        return;
+    }
+
     // outer_wall_speed is the ratio_over target for small_perimeter_speed.
     // Different values per extruder to verify parent resolves at the same element index.
     config.set_deserialize_strict({
