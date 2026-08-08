@@ -1,0 +1,220 @@
+# HackPGH fork-only workflow. Keeps this fork tracking upstream OrcaSlicer/OrcaSlicer:
+# once a day it rebuilds `main` as "latest upstream + our hackpgh/* patches", then, if
+# upstream has published a new *stable* release the fork doesn't have yet, kicks off
+# hackpgh-release.yml to build and publish it.
+#
+# hackpgh/generate/* branches are special: they carry a transformation script instead of
+# a diff. After ALL hackpgh/* branches are merged, every scripts/hackpgh/*/generate.sh
+# found in the assembled tree is run (sorted) and its output committed. A generate script
+# must be deterministic and exit nonzero on upstream drift — a failure aborts the sync
+# (main untouched) and opens/refreshes a tracking issue.
+#
+# IMPORTANT: this file (and every fork-only change) must live on a hackpgh/* branch that
+# this workflow merges in. Anything committed straight to `main` is wiped by the daily
+# reset to upstream/main.
+name: HackPGH Sync
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # daily at 08:00 UTC
+  workflow_dispatch:
+  push:
+    branches:
+      - 'hackpgh/**'        # a push to a patch branch re-syncs main and may cut a new iteration
+      - '!hackpgh/rel/**'   # ...except the transient release build branches
+
+concurrency:
+  group: hackpgh-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # force-push main
+  issues: write     # open a tracking issue on merge conflict
+  actions: write    # dispatch hackpgh-release.yml
+
+env:
+  UPSTREAM: OrcaSlicer/OrcaSlicer
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync:
+    name: Sync main from upstream + merge hackpgh/*
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          set -euo pipefail
+          git config user.name  "HackPGH"
+          git config user.email "info@hackpittsburgh.org"
+          # Enable signing only if the imported key can actually sign headlessly;
+          # a broken signing setup must degrade to unsigned commits, not break
+          # every git merge/commit in the run.
+          if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+            if echo test | gpg --batch --yes --pinentry-mode loopback \
+                 --local-user AF562EF1507A4C45E410E1934CB496222D702AA5 \
+                 --clearsign >/dev/null 2>&1; then
+              git config --global user.signingkey AF562EF1507A4C45E410E1934CB496222D702AA5
+              git config --global commit.gpgsign true
+              git config --global tag.gpgSign true
+              echo "GPG signing enabled."
+            else
+              echo "::warning::GPG key imported but a test signature failed (passphrase/pinentry?); commits will be unsigned."
+            fi
+          else
+            echo "::warning::GPG_PRIVATE_KEY secret not set; commits will be unsigned."
+          fi
+        env:
+          GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Fetch upstream and all fork branches
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream main
+          # make sure every origin/hackpgh/* branch is available locally
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Rebuild main = upstream/main + merged hackpgh/*
+        run: |
+          set -euo pipefail
+          git checkout -B synced upstream/main
+
+          # Merge every hackpgh/* branch except the transient release build branches (hackpgh/rel/*).
+          mapfile -t branches < <(git branch -r --list 'origin/hackpgh/*' \
+            | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' || true)
+
+          if [ ${#branches[@]} -eq 0 ]; then
+            echo "::warning::No hackpgh/* branches found to merge; main will match upstream exactly."
+          fi
+
+          for b in "${branches[@]}"; do
+            echo "::group::Merging $b"
+            if ! git merge --no-edit --no-ff "$b"; then
+              git merge --abort || true
+              echo "::endgroup::"
+              echo "::error::Merge conflict between upstream/main and $b. main left untouched."
+              title="Sync conflict: ${b#origin/} vs upstream/main"
+              body=$(printf 'The daily HackPGH sync could not merge `%s` onto the latest `upstream/main` because of a conflict.\n\n`main` was **not** updated this run. Please rebase/resolve `%s` against upstream and re-run **HackPGH Sync**.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "${b#origin/}" "${b#origin/}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              # De-dupe: reuse an existing open issue with the same title if present.
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label "sync-conflict" 2>/dev/null \
+                  || gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Apply generate scripts (hackpgh/generate/*)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          gens=(scripts/hackpgh/*/generate.sh)
+          if [ ${#gens[@]} -eq 0 ]; then
+            echo "No generate scripts in the merged tree; skipping."
+            exit 0
+          fi
+          mapfile -t gens < <(printf '%s\n' "${gens[@]}" | LC_ALL=C sort)
+          for g in "${gens[@]}"; do
+            name=$(basename "$(dirname "$g")")
+            echo "::group::Running $g"
+            if ! bash "$g"; then
+              echo "::endgroup::"
+              echo "::error::Generate script $g failed. main left untouched."
+              title="Generate failure: $name"
+              body=$(printf 'The HackPGH sync could not apply `%s` to the merged tree: the script exited nonzero (usually a drift assertion — upstream moved an anchor the script expects).\n\n`main` was **not** updated this run. Fix the script on its `hackpgh/generate/%s` branch and re-run **HackPGH Sync**.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "$g" "$name" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label "sync-conflict" 2>/dev/null \
+                  || gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "HackPGH: apply generate scripts"
+            echo "Generate output committed: $(git rev-parse --short HEAD)"
+          else
+            echo "Generate scripts produced no changes."
+          fi
+
+      - name: Push rebuilt main
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin synced:main
+          echo "main updated: upstream/main + merged hackpgh/* branches + generate output."
+
+      - name: Evaluate whether to cut a new HackPGH iteration
+        run: |
+          set -euo pipefail
+
+          # Base = latest stable (non-draft, non-prerelease) upstream release tag.
+          base=$(gh api "repos/${UPSTREAM}/releases" --paginate \
+            --jq 'map(select(.draft==false and .prerelease==false)) | sort_by(.published_at) | reverse | .[0].tag_name // empty')
+          if [ -z "$base" ]; then
+            echo "No upstream stable release found; nothing to mirror."
+            exit 0
+          fi
+          echo "Latest upstream stable base: $base"
+
+          # Fingerprint = sha256 of the sorted "<branch> <sha>" lines for the exact patch set the
+          # release will cherry-pick (every origin/hackpgh/* except the transient rel branches).
+          fp=$(git branch -r --list 'origin/hackpgh/*' \
+                 | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' \
+                 | while read -r b; do echo "$b $(git rev-parse "$b")"; done \
+                 | sort | sha256sum | cut -d' ' -f1)
+          echo "Current hackpgh fingerprint: $fp"
+
+          # Find the highest existing iteration for this base (drafts included) and its stored fingerprint.
+          latest_tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName --jq \
+            "[.[] | select(.tagName | test(\"^${base}\\\\+hackpgh\\\\.[0-9]+$\")) | .tagName] | sort_by(sub(\".*hackpgh\\\\.\";\"\") | tonumber) | last // empty")
+
+          if [ -z "$latest_tag" ]; then
+            # No iteration for this base yet -> always publish .0 (new base / first setup).
+            echo "No $base+hackpgh.* release yet; dispatching iteration 0."
+            gh workflow run hackpgh-release.yml --repo "$GITHUB_REPOSITORY" \
+              -f upstream_tag="$base" -f iteration=0 -f fingerprint="$fp"
+            exit 0
+          fi
+
+          k=${latest_tag##*hackpgh.}
+          echo "Highest existing iteration for $base: $k ($latest_tag)"
+
+          # If that iteration is still a draft, a build is in progress -> don't stack another.
+          is_draft=$(gh release view "$latest_tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          if [ "$is_draft" = "true" ]; then
+            echo "$latest_tag is still a draft (build in progress); skipping."
+            exit 0
+          fi
+
+          # Compare fingerprints; skip if the patch set is unchanged.
+          stored_fp=$(gh release view "$latest_tag" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' \
+            | grep -oE 'hackpgh-fingerprint: [0-9a-f]+' | awk '{print $2}' | head -1 || true)
+          if [ "$stored_fp" = "$fp" ]; then
+            echo "hackpgh/* unchanged since $latest_tag (fingerprint match); nothing to publish."
+            exit 0
+          fi
+
+          next=$((k + 1))
+          echo "hackpgh/* changed since $latest_tag; dispatching iteration $next."
+          gh workflow run hackpgh-release.yml --repo "$GITHUB_REPOSITORY" \
+            -f upstream_tag="$base" -f iteration="$next" -f fingerprint="$fp"

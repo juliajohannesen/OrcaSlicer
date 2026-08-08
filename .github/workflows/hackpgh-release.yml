@@ -1,0 +1,343 @@
+# HackPGH fork-only workflow. Builds and publishes one upstream release tag as a fork
+# release: check out upstream's tagged commit, merge our hackpgh/* patches onto it, run
+# any scripts/hackpgh/*/generate.sh (hackpgh/generate/* transformation branches) against
+# the assembled tree, build every platform through the existing build_all.yml pipeline,
+# then upload the artifacts to a GitHub Release that starts as a draft and is flipped to
+# published only after the build succeeds. Normally invoked by hackpgh-sync.yml; can also
+# be run manually for any tag.
+name: HackPGH Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream release tag to build and publish (e.g. v2.4.2)'
+        required: true
+        type: string
+      iteration:
+        description: 'HackPGH iteration number N for this base (fork release is <tag>+hackpgh.N)'
+        required: true
+        type: string
+      fingerprint:
+        description: 'Fingerprint of the hackpgh/* patch set; recorded in the release body for change detection'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: hackpgh-release-${{ inputs.upstream_tag }}+hackpgh.${{ inputs.iteration }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # push build branch, create/edit release, upload assets
+  actions: write    # dispatch build_all.yml and read its artifacts
+  issues: write     # open a tracking issue on merge conflict
+
+env:
+  UPSTREAM: OrcaSlicer/OrcaSlicer
+  TAG: ${{ inputs.upstream_tag }}
+  ITERATION: ${{ inputs.iteration }}
+  FINGERPRINT: ${{ inputs.fingerprint }}
+  FORK_TAG: ${{ inputs.upstream_tag }}+hackpgh.${{ inputs.iteration }}
+  REL_BRANCH: hackpgh/rel/${{ inputs.upstream_tag }}+hackpgh.${{ inputs.iteration }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build-and-publish:
+    name: Build ${{ inputs.upstream_tag }}+hackpgh.${{ inputs.iteration }} + publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # release builds can take ~1-2h; stay under the 6h job cap
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          # Push with HACKPGH_PUSH_TOKEN, not GITHUB_TOKEN (see the fetch step's guard).
+          token: ${{ secrets.HACKPGH_PUSH_TOKEN || github.token }}
+
+      - name: Configure git identity
+        run: |
+          set -euo pipefail
+          git config user.name  "HackPGH"
+          git config user.email "info@hackpittsburgh.org"
+          # Enable signing only if the imported key can actually sign headlessly;
+          # a broken signing setup must degrade to unsigned commits, not break
+          # every git merge/commit in the run.
+          if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+            if echo test | gpg --batch --yes --pinentry-mode loopback \
+                 --local-user AF562EF1507A4C45E410E1934CB496222D702AA5 \
+                 --clearsign >/dev/null 2>&1; then
+              git config --global user.signingkey AF562EF1507A4C45E410E1934CB496222D702AA5
+              git config --global commit.gpgsign true
+              git config --global tag.gpgSign true
+              echo "GPG signing enabled."
+            else
+              echo "::warning::GPG key imported but a test signature failed (passphrase/pinentry?); commits will be unsigned."
+            fi
+          else
+            echo "::warning::GPG_PRIVATE_KEY secret not set; commits will be unsigned."
+          fi
+        env:
+          GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Fetch upstream tag and fork branches
+        env:
+          HACKPGH_PUSH_TOKEN: ${{ secrets.HACKPGH_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+          git fetch --no-tags upstream main   # needed to isolate each hackpgh branch's own commits
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+          # The release branch carries the upstream tag's history, whose .github/workflows
+          # files are not reachable from any fork ref. GitHub rejects pushing those with the
+          # Actions GITHUB_TOKEN (a GitHub App token that cannot hold the `workflows`
+          # permission), so the checkout step persists HACKPGH_PUSH_TOKEN instead — a
+          # fine-grained PAT on this repo with Contents:RW + Workflows:RW. Only this
+          # workflow needs it: routing the sync workflow's main push through a PAT would
+          # stop suppressing `on: push` triggers and start a full upstream build_all on
+          # every daily sync. Fail fast here, before an hour of assembly work.
+          if [ -z "${HACKPGH_PUSH_TOKEN:-}" ]; then
+            echo "::error::HACKPGH_PUSH_TOKEN secret not set; pushing the release branch would be rejected because GITHUB_TOKEN cannot push workflow files. Create a fine-grained PAT (Contents:RW + Workflows:RW on ${GITHUB_REPOSITORY}) and save it as the HACKPGH_PUSH_TOKEN repo secret."
+            exit 1
+          fi
+
+      - name: Build release branch = tag + hackpgh/* patches
+        run: |
+          set -euo pipefail
+          git checkout -B "$REL_BRANCH" "refs/tags/${TAG}"
+
+          mapfile -t branches < <(git branch -r --list 'origin/hackpgh/*' \
+            | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' || true)
+
+          # Apply only each branch's OWN commits (those not already in upstream/main) onto the
+          # release tag. Do NOT `git merge` the branches: a hackpgh/* branch is based on recent
+          # upstream, so merging it onto an older tag drags the whole tag->HEAD upstream delta in
+          # as conflicts. Cherry-picking upstream/main..<branch> transplants just the fork's patches.
+
+          # cherry-pick that drops empty commits instead of stopping on them. Covers both
+          # commits that were empty to begin with (sync-trigger markers) and ones that become
+          # empty because the patch is already in the tag. `--empty=drop` alone is not enough:
+          # it only drops the became-empty kind. An empty stop is distinguishable from a
+          # conflict stop by its clean index (no unmerged paths, nothing staged).
+          cherry_pick_dropping_empties() {
+            if git cherry-pick -x "$@"; then
+              return 0
+            fi
+            while git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+                  && [ -z "$(git diff --name-only --diff-filter=U)" ] \
+                  && git diff --cached --quiet; do
+              echo "Dropping empty commit: $(git log -1 --format='%h %s' CHERRY_PICK_HEAD)"
+              if git cherry-pick --skip; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          for b in "${branches[@]}"; do
+            mapfile -t commits < <(git rev-list --reverse --no-merges "upstream/main..$b")
+            if [ ${#commits[@]} -eq 0 ]; then
+              echo "$b has no commits beyond upstream/main; skipping."
+              continue
+            fi
+            echo "::group::Cherry-picking ${#commits[@]} commit(s) from $b onto $TAG"
+            if ! cherry_pick_dropping_empties "${commits[@]}"; then
+              conflicted=$(git diff --name-only --diff-filter=U | sed 's/^/  - /')
+              git cherry-pick --abort || true
+              echo "::endgroup::"
+              title="Release conflict: ${b#origin/} vs ${TAG}"
+              body=$(printf 'Building release `%s` failed: the patches on `%s` do not apply cleanly to the `%s` source (they were authored against newer upstream). Conflicting file(s):\n\n%s\n\nRebase/resolve `%s` against `%s` (or provide a %s-compatible variant) and re-run **HackPGH Release** with `upstream_tag=%s`.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "$TAG" "${b#origin/}" "$TAG" "$conflicted" "${b#origin/}" "$TAG" "$TAG" "$TAG" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              echo "::error::$title"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Apply generate scripts (hackpgh/generate/*)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          gens=(scripts/hackpgh/*/generate.sh)
+          if [ ${#gens[@]} -eq 0 ]; then
+            echo "No generate scripts in the release tree; skipping."
+            exit 0
+          fi
+          mapfile -t gens < <(printf '%s\n' "${gens[@]}" | LC_ALL=C sort)
+          for g in "${gens[@]}"; do
+            name=$(basename "$(dirname "$g")")
+            echo "::group::Running $g"
+            if ! bash "$g"; then
+              echo "::endgroup::"
+              title="Release generate failure: $name vs ${TAG}"
+              body=$(printf 'Building release `%s` failed: generate script `%s` exited nonzero against the `%s` source (usually a drift assertion — the tagged tree differs from what the script expects).\n\nFix the script on its `hackpgh/generate/%s` branch (or provide a %s-compatible variant) and re-run **HackPGH Release** with `upstream_tag=%s`.\n\n_Run: %s/%s/actions/runs/%s_' \
+                "$TAG" "$g" "$TAG" "$name" "$TAG" "$TAG" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              echo "::error::$title"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "HackPGH: apply generate scripts"
+            echo "Generate output committed: $(git rev-parse --short HEAD)"
+          else
+            echo "Generate scripts produced no changes."
+          fi
+
+      - name: Stamp the fork version into version.inc
+        run: |
+          set -euo pipefail
+          fork_ver="${TAG#v}+hackpgh.${ITERATION}"
+          # This is the value the whole pipeline reads for artifact names and the in-app version.
+          sed -i -E 's|set\(SoftFever_VERSION "[^"]*"\)|set(SoftFever_VERSION "'"$fork_ver"'")|' version.inc
+          grep 'set(SoftFever_VERSION' version.inc
+          git add version.inc
+          git commit -m "HackPGH: set version ${fork_ver}"
+          git push --force-with-lease origin "$REL_BRANCH"
+
+      - name: Create draft release (if absent)
+        run: |
+          set -euo pipefail
+          if gh release view "$FORK_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $FORK_TAG already exists and is published. Aborting."
+              exit 1
+            fi
+            echo "Reusing existing draft release $FORK_TAG."
+          else
+            # Human-readable list of the patch branches + tips that went into this build.
+            branch_lines=$(git branch -r --list 'origin/hackpgh/*' \
+              | sed 's|^[[:space:]]*||' | grep -v '^origin/hackpgh/rel/' \
+              | while read -r b; do echo "- \`${b#origin/}\` @ $(git rev-parse --short "$b")"; done)
+            notes=$(printf 'HackPGH build of upstream **%s** with the fork'"'"'s hackpgh/* patches (iteration %s).\n\nPatch branches:\n%s\n\n<!-- hackpgh-fingerprint: %s -->' \
+              "$TAG" "$ITERATION" "$branch_lines" "$FINGERPRINT")
+            gh release create "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --target "$REL_BRANCH" \
+              --title "$FORK_TAG (HackPGH)" \
+              --notes "$notes" \
+              --verify-tag=false
+          fi
+
+      - name: Dispatch build_all.yml on the release branch
+        id: dispatch
+        run: |
+          set -euo pipefail
+          # Timestamp just before dispatch so we can identify the run we created.
+          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run build_all.yml --repo "$GITHUB_REPOSITORY" --ref "$REL_BRANCH"
+          echo "since=$before" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the dispatched build run id
+        id: run
+        run: |
+          set -euo pipefail
+          since="${{ steps.dispatch.outputs.since }}"
+          run_id=""
+          for i in $(seq 1 24); do   # up to ~6 min for the run to register
+            run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+              --workflow build_all.yml --branch "$REL_BRANCH" --event workflow_dispatch \
+              --json databaseId,createdAt --limit 20 \
+              --jq "map(select(.createdAt >= \"$since\")) | sort_by(.createdAt) | reverse | .[0].databaseId // empty")
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            echo "Build run not visible yet (attempt $i); waiting..."
+            sleep 15
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::Could not find the dispatched build_all run for $REL_BRANCH."
+            exit 1
+          fi
+          echo "Build run id: $run_id"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the build to finish
+        run: |
+          set -euo pipefail
+          # Blocks until the run completes; exits non-zero if it did not succeed,
+          # which leaves the release as a draft for inspection.
+          gh run watch "${{ steps.run.outputs.run_id }}" --repo "$GITHUB_REPOSITORY" \
+            --interval 60 --exit-status
+
+      # ---- asset assembly reused from .github/workflows/publish_release.yml:74-131 ----
+      - name: Download release artifacts from build run
+        env:
+          RUN_ID: ${{ steps.run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          # Windows_V* (not Windows_*) keeps the MSIX Store artifact out: it goes to Partner Center, not GitHub releases.
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts \
+            -p 'OrcaSlicer_Windows_V*' \
+            -p 'OrcaSlicer_Mac_universal_*' \
+            -p 'OrcaSlicer_Linux_ubuntu_*' \
+            -p 'OrcaSlicer-Linux-flatpak_*' \
+            -p 'PDB'
+          echo "Downloaded artifact folders:"
+          ls -1 artifacts
+
+      - name: Assemble release assets
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+
+          # gh run download auto-extracts each artifact into a folder, so the inner
+          # binaries are already unzipped. Copy the inner binary for each platform.
+          find artifacts -type f -name '*.exe' -path '*OrcaSlicer_Windows_V*' ! -path '*_portable*' -exec cp -v {} upload/ \;
+          find artifacts -type f -name '*.dmg' -path '*OrcaSlicer_Mac_universal_*' -exec cp -v {} upload/ \;
+          find artifacts -type f -name '*.AppImage' -exec cp -v {} upload/ \;
+          find artifacts -type f -name '*.flatpak' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'Debug_PDB_*.7z' -exec cp -v {} upload/ \;
+
+          # Portable Windows builds (x64 + arm64) are unzipped folder artifacts; re-zip each.
+          mapfile -t portable_dirs < <(find artifacts -maxdepth 1 -type d -name 'OrcaSlicer_Windows_*_portable')
+          if [ ${#portable_dirs[@]} -eq 0 ]; then
+            echo "::warning::Windows portable artifact not found."
+          fi
+          for portable_dir in "${portable_dirs[@]}"; do
+            ( cd "$portable_dir" && zip -qr "$GITHUB_WORKSPACE/upload/$(basename "$portable_dir").zip" . )
+            echo "Zipped portable -> $(basename "$portable_dir").zip"
+          done
+
+          echo "Assets to upload:"
+          ls -lh upload
+          if [ -z "$(ls -A upload)" ]; then
+            echo "::error::No assets assembled. Check the build run's artifacts."
+            exit 1
+          fi
+
+      - name: Upload assets to the draft release
+        run: |
+          set -euo pipefail
+          gh release upload "$FORK_TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+
+      - name: Publish the release (flip out of draft)
+        run: |
+          set -euo pipefail
+          gh release edit "$FORK_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Published release $FORK_TAG."
+
+      - name: Delete the transient build branch
+        # Only on success; a failed run keeps the branch so the exact built ref can be inspected.
+        run: |
+          git push origin --delete "$REL_BRANCH" 2>/dev/null || true
