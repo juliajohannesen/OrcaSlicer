@@ -341,6 +341,34 @@ SelectMachineDialog::SelectMachineDialog(Plater *plater)
     Bind(wxEVT_REFRESH_DATA, &SelectMachineDialog::update_best_pos_dialog, this);
 
     sizer_basic_right_info->Add(sizer_rename, 0, wxTOP, 0);
+    // ORCA required user name + filament-ownership flag, prepended to the job name as
+    // "<user>_<Personal|HackPGHOwned>_<job>" (e.g. per-user filament tracking). Kept as one
+    // block anchored on the Add(sizer_rename) line above, which is identical across the
+    // upstream versions we cherry-pick this patch onto; both rows sit underneath the
+    // project (job) name.
+    auto sizer_user_name = new wxBoxSizer(wxHORIZONTAL);
+    auto user_name_label = new Label(m_basic_panel, _L("Your name"));
+    user_name_label->SetFont(::Label::Head_14);
+    user_name_label->SetBackgroundColour(*wxWHITE);
+    m_user_name_input = new ::TextInput(m_basic_panel, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+    m_user_name_input->GetTextCtrl()->SetFont(::Label::Body_13);
+    m_user_name_input->SetMinSize(wxSize(FromDIP(240), FromDIP(24)));
+    m_user_name_input->SetMaxSize(wxSize(FromDIP(240), FromDIP(24)));
+    sizer_user_name->Add(user_name_label, 0, wxALIGN_CENTER, 0);
+    sizer_user_name->Add(m_user_name_input, 0, wxALIGN_CENTER | wxLEFT, FromDIP(6));
+
+    auto sizer_personal_filament = new wxBoxSizer(wxHORIZONTAL);
+    m_personal_filament_check = new CheckBox(m_basic_panel, wxID_ANY);
+    m_personal_filament_check->SetValue(false);
+    m_personal_filament_check->SetBackgroundColour(*wxWHITE);
+    auto personal_filament_label = new Label(m_basic_panel, _L("Using personal filament?"));
+    personal_filament_label->SetFont(::Label::Head_13);
+    personal_filament_label->SetBackgroundColour(*wxWHITE);
+    sizer_personal_filament->Add(personal_filament_label, 0, wxALIGN_CENTER, 0);
+    sizer_personal_filament->Add(m_personal_filament_check, 0, wxALIGN_CENTER | wxLEFT, FromDIP(6));
+
+    sizer_basic_right_info->Add(sizer_user_name, 0, wxTOP, FromDIP(5));
+    sizer_basic_right_info->Add(sizer_personal_filament, 0, wxTOP, FromDIP(5));
     sizer_basic_right_info->Add(0, 0, 0, wxTOP, FromDIP(5));
     sizer_basic_right_info->Add(m_sizer_basic_weight_time, 0, wxTOP, 0);
     sizer_basic_right_info->Add(0, 0, 0, wxTOP, FromDIP(10));
@@ -3485,6 +3513,22 @@ void SelectMachineDialog::on_send_print()
 {
     BOOST_LOG_TRIVIAL(info) << "print_job: on_ok to send";
     m_is_canceled = false;
+
+    // ORCA a valid user name is required for a normal print; it is prepended to the job name below.
+    // Validate up front so an empty/invalid name aborts before any export or state change.
+    if (m_print_type == PrintFromType::FROM_NORMAL) {
+        wxString user_name = m_user_name_input->GetTextCtrl()->GetValue();
+        user_name.Trim(true).Trim(false);
+        wxString filtered = from_u8(filter_characters(user_name.ToUTF8().data(), "<>[]:/\\|?*\""));
+        if (filtered.empty() || filtered != user_name || user_name.length() > 30) {
+            MessageDialog(this,
+                          _L("Please enter a valid name (1-30 characters, and none of <>[]:/\\|?*\") before sending."),
+                          _L("Name required"), wxICON_WARNING | wxOK)
+                .ShowModal();
+            return;
+        }
+    }
+
     Enable_Send_Button(false);
 
     if (m_mapping_popup.IsShown())
@@ -3588,7 +3632,12 @@ void SelectMachineDialog::on_send_print()
     if (m_print_type == PrintFromType::FROM_NORMAL) {
         BOOST_LOG_TRIVIAL(info) << "print_job: m_print_type = from_normal";
         m_print_job->m_print_type = "from_normal";
-        m_print_job->set_project_name(m_current_project_name.utf8_string());
+        // ORCA prepend the (already validated) user name and filament-ownership flag:
+        // "<user>_<Personal|HackPGHOwned>_<job>"
+        wxString user_name = m_user_name_input->GetTextCtrl()->GetValue();
+        user_name.Trim(true).Trim(false);
+        const std::string filament_owner = m_personal_filament_check->GetValue() ? "Personal" : "HackPGHOwned";
+        m_print_job->set_project_name(user_name.utf8_string() + "_" + filament_owner + "_" + m_current_project_name.utf8_string());
     }
     else if(m_print_type == PrintFromType::FROM_SDCARD_VIEW){
         BOOST_LOG_TRIVIAL(info) << "print_job: m_print_type = from_sdcard_view";
@@ -5331,6 +5380,11 @@ void SelectMachineDialog::set_default()
 
     m_rename_text->SetLabelText(m_current_project_name);
     m_rename_normal_panel->Layout();
+
+    // ORCA start the user name blank (required before sending) and default the filament
+    // flag to HackPGH-owned on every open
+    if (m_user_name_input) m_user_name_input->GetTextCtrl()->SetValue(wxEmptyString);
+    if (m_personal_filament_check) m_personal_filament_check->SetValue(false);
 
     //clear combobox
     m_list.clear();
