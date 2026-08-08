@@ -6064,7 +6064,10 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
             std::stringstream           json_stream(body);
             boost::property_tree::read_json(json_stream, root);
 
-            std::regex matcher("[0-9]+\\.[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9]+)?(\\+[A-Za-z0-9]+)?");
+            // ORCA/HackPGH: allow '.' in the +build metadata segment (e.g. 2.4.2+hackpgh.1) so the
+            // fork version passes this full-string regex_match; otherwise get_version() returns
+            // invalid and the updater falsely reports an available update.
+            std::regex matcher("[0-9]+\\.[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9]+)?(\\+[A-Za-z0-9.]+)?");
             Semver    current_version = get_version(SoftFever_VERSION, matcher);
             Semver    best_pre(0, 0, 0);
             Semver    best_release(0, 0, 0);
@@ -6074,6 +6077,17 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
             std::string best_release_url;
             std::string best_release_content;
             std::string best_pre_content;
+
+            // HackPGH: iterations are encoded as +hackpgh.N build metadata, which semver_compare
+            // ignores. Track each candidate's N (or -1 if absent) to break ties between fork
+            // releases that share a base version.
+            long best_pre_iter = -1;
+            long best_release_iter = -1;
+            auto hackpgh_iteration = [](const std::string& v) -> long {
+                auto pos = v.find("+hackpgh.");
+                if (pos == std::string::npos) return -1;
+                try { return std::stol(v.substr(pos + 9)); } catch (...) { return -1; }
+            };
 
             auto consider_release = [&](const boost::property_tree::ptree& node) {
                 auto tag_opt = node.get_optional<std::string>("tag_name");
@@ -6092,18 +6106,25 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
                 const std::string html_url = node.get_optional<std::string>("html_url").get_value_or(std::string());
                 const std::string body_copy = node.get_optional<std::string>("body").get_value_or(std::string());
 
+                // Newer if the base version is greater, or the base is equal but the HackPGH
+                // iteration is higher (semver '<' can't see the +hackpgh.N metadata).
+                const long iter = hackpgh_iteration(tag);
                 if (is_prerelease) {
-                    if (!best_pre_valid || best_pre < tag_version) {
+                    if (!best_pre_valid || best_pre < tag_version
+                        || (best_pre == tag_version && iter > best_pre_iter)) {
                         best_pre        = tag_version;
                         best_pre_url    = html_url;
                         best_pre_content = body_copy;
+                        best_pre_iter   = iter;
                         best_pre_valid  = true;
                     }
                 } else {
-                    if (!best_release_valid || best_release < tag_version) {
+                    if (!best_release_valid || best_release < tag_version
+                        || (best_release == tag_version && iter > best_release_iter)) {
                         best_release         = tag_version;
                         best_release_url     = html_url;
                         best_release_content = body_copy;
+                        best_release_iter    = iter;
                         best_release_valid   = true;
                     }
                 }
@@ -6126,12 +6147,15 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
                 best_pre        = best_release;
                 best_pre_url    = best_release_url;
                 best_pre_content = best_release_content;
+                best_pre_iter   = best_release_iter;
                 best_pre_valid  = true;
             }
 
             const bool        prefer_release = check_stable_only || !best_pre_valid;
             const Semver&     chosen_version = prefer_release ? best_release : best_pre;
             const bool        chosen_valid   = prefer_release ? best_release_valid : best_pre_valid;
+            const long        chosen_iter    = prefer_release ? best_release_iter : best_pre_iter;
+            const long        current_iter   = hackpgh_iteration(SoftFever_VERSION);
 
             if (!chosen_valid) {
                 if (by_user != 0)
@@ -6139,14 +6163,18 @@ void GUI_App::check_new_version_sf(bool show_tips, int by_user)
                 return;
             }
 
-            if (current_version.valid() && chosen_version <= current_version) {
+            // Up to date if the candidate's base is <= ours, UNLESS the base is equal and its
+            // HackPGH iteration is newer (build metadata is invisible to semver comparison).
+            if (current_version.valid() && chosen_version <= current_version
+                && !(chosen_version == current_version && chosen_iter > current_iter)) {
                 if (by_user != 0)
                     this->no_new_version();
                 return;
             }
 
             version_info.url           = prefer_release ? best_release_url : best_pre_url;
-            version_info.version_str   = prefer_release ? best_release.to_string_sf() : best_pre.to_string_sf();
+            version_info.version_str   = (prefer_release ? best_release.to_string_sf() : best_pre.to_string_sf())
+                                         + (chosen_iter >= 0 ? "+hackpgh." + std::to_string(chosen_iter) : std::string());
             version_info.description   = prefer_release ? best_release_content : best_pre_content;
             version_info.force_upgrade = false;
 
